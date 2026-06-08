@@ -1,0 +1,12 @@
+{
+  "domain": "ajjas",
+  "name": "Ajjas GPS Tracker",
+  "version": "1.0.0",
+  "documentation": "https://github.com/arunj4144/ajjas-ha",
+  "issue_tracker": "https://github.com/arunj4144/ajjas-ha/issues",
+  "requirements": [],
+  "dependencies": [],
+  "codeowners": ["@arunj4144"],
+  "iot_class": "cloud_push",
+  "config_flow": true
+}

@@ -1,0 +1,26 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Ajjas GPS Tracker",
+        "description": "Enter your Ajjas account credentials.",
+        "data": {
+          "email": "Email",
+          "password": "Password"
+        }
+      },
+      "manual": {
+        "title": "Ajjas — Manual Cookie Setup",
+        "description": "Enter your session cookie (connect.sid value) and vehicle ID. You can find these using a proxy like mitmproxy.",
+        "data": {
+          "cookie": "Session Cookie",
+          "vehicle_id": "Vehicle ID"
+        }
+      }
+    },
+    "error": {
+      "invalid_auth": "Invalid email or password.",
+      "cannot_connect": "Could not connect to Ajjas servers."
+    }
+  }
+}
