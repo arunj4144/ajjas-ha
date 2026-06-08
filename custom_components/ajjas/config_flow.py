@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import re
+import socket
 import urllib.parse
 from typing import Any
 
@@ -69,7 +70,8 @@ class AjjasConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         return self.async_show_form(step_id="manual", data_schema=STEP_COOKIE_SCHEMA, errors=errors)
 
     async def _login_and_get_vehicle(self, mobile: str, password: str) -> tuple[str, int]:
-        async with aiohttp.ClientSession() as session:
+        connector = aiohttp.TCPConnector(family=socket.AF_INET)
+        async with aiohttp.ClientSession(connector=connector) as session:
             # Step 1: Login
             resp = await session.post(
                 LOGIN_URL,

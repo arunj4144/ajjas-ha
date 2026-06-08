@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import socket
 import urllib.parse
 from datetime import timedelta
 
@@ -50,7 +51,8 @@ class AjjasCoordinator(DataUpdateCoordinator):
 
     async def _fetch(self) -> dict:
         if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession()
+            connector = aiohttp.TCPConnector(family=socket.AF_INET)
+            self._session = aiohttp.ClientSession(connector=connector)
 
         result = dict(self.data)
 
