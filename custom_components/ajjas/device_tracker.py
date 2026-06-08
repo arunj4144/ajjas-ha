@@ -40,11 +40,17 @@ class AjjasDeviceTracker(CoordinatorEntity, TrackerEntity):
 
     @property
     def extra_state_attributes(self) -> dict:
-        data = self.coordinator.data
+        d = self.coordinator.data
         return {
-            "bearing": data.get("bearing"),
-            "speed": data.get("speed"),
-            "ignition": data.get("ignition"),
-            "last_seen": data.get("last_seen"),
-            "battery_voltage": data.get("battery_voltage"),
+            "bearing": d.get("bearing"),
+            "speed": d.get("speed"),
+            "ignition": d.get("ignition"),
+            "last_seen": d.get("last_seen"),
+            "battery_voltage": d.get("battery_voltage"),
+            "registration": d.get("registration"),
+            "make": d.get("make"),
+            "model": d.get("model"),
+            "tank_capacity_l": d.get("tank_capacity"),
+            "mileage_kmpl": d.get("mileage"),
+            "relay_enabled": d.get("relay_enabled"),
         }

@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 import urllib.parse
 from typing import Any
 
@@ -8,12 +9,12 @@ import voluptuous as vol
 from homeassistant import config_entries
 from homeassistant.data_entry_flow import FlowResult
 
-from .const import DOMAIN, LOGIN_URL, WS_BASE, WS_PARAMS
+from .const import DOMAIN, VERIF_URL, LOGIN_URL, WS_URL, WS_PARAMS, WS_HEADERS
 
 _LOGGER = logging.getLogger(__name__)
 
 STEP_USER_SCHEMA = vol.Schema({
-    vol.Required("email"): str,
+    vol.Required("mobile", description={"suggested_value": "+91"}): str,
     vol.Required("password"): str,
 })
 
@@ -27,35 +28,36 @@ class AjjasConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     VERSION = 1
 
     async def async_step_user(self, user_input: dict[str, Any] | None = None) -> FlowResult:
-        errors = {}
+        errors: dict[str, str] = {}
         if user_input is not None:
+            mobile = user_input["mobile"].strip()
+            if not mobile.startswith("+"):
+                mobile = "+91" + mobile.lstrip("0")
             try:
-                cookie, vehicle_id = await self._login(user_input["email"], user_input["password"])
+                cookie = await self._do_login(mobile, user_input["password"])
+                vehicle_id = await self._get_vehicle_id(cookie)
                 return self.async_create_entry(
-                    title=f"Ajjas ({user_input['email']})",
-                    data={"cookie": cookie, "vehicle_id": vehicle_id, "email": user_input["email"]},
+                    title=f"Ajjas ({mobile})",
+                    data={"mobile": mobile, "cookie": cookie, "vehicle_id": vehicle_id},
                 )
-            except ValueError as e:
-                _LOGGER.warning("Ajjas login failed: %s", e)
+            except ValueError:
                 errors["base"] = "invalid_auth"
-            except Exception as e:
-                _LOGGER.error("Ajjas login error: %s", e)
+            except Exception as err:
+                _LOGGER.error("Ajjas setup error: %s", err)
                 errors["base"] = "cannot_connect"
 
         return self.async_show_form(
             step_id="user",
             data_schema=STEP_USER_SCHEMA,
             errors=errors,
-            description_placeholders={"fallback_note": "Or use Manual Cookie entry below"},
         )
 
     async def async_step_manual(self, user_input: dict[str, Any] | None = None) -> FlowResult:
-        errors = {}
+        errors: dict[str, str] = {}
         if user_input is not None:
             cookie = user_input["cookie"].strip()
-            vehicle_id = user_input["vehicle_id"]
-            ok = await self._test_ws(cookie, vehicle_id)
-            if ok:
+            vehicle_id = int(user_input["vehicle_id"])
+            if await self._test_ws(cookie):
                 return self.async_create_entry(
                     title=f"Ajjas (Vehicle {vehicle_id})",
                     data={"cookie": cookie, "vehicle_id": vehicle_id},
@@ -68,54 +70,61 @@ class AjjasConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             errors=errors,
         )
 
-    async def _login(self, email: str, password: str) -> tuple[str, int]:
+    async def _do_login(self, mobile: str, password: str) -> str:
         async with aiohttp.ClientSession() as session:
             resp = await session.post(
                 LOGIN_URL,
-                json={"email": email, "password": password},
-                headers={"Content-Type": "application/json"},
+                json={"cmob": mobile, "pwd": password, "alang": 1},
+                headers={**WS_HEADERS, "Content-Type": "application/json"},
                 timeout=aiohttp.ClientTimeout(total=15),
             )
             if resp.status != 200:
-                raise ValueError(f"Login returned {resp.status}")
+                raise ValueError(f"Login failed: HTTP {resp.status}")
 
-            body = await resp.json()
             cookie = None
-            for header_val in resp.headers.getall("Set-Cookie", []):
-                for part in header_val.split(";"):
-                    part = part.strip()
-                    if part.startswith("connect.sid="):
-                        cookie = part[len("connect.sid="):]
-                        break
-
-            if not cookie:
-                # fallback: try body
-                cookie = body.get("data", {}).get("cookie") or body.get("cookie")
+            for set_cookie in resp.headers.getall("Set-Cookie", []):
+                m = re.search(r"connect\.sid=([^;]+)", set_cookie)
+                if m:
+                    cookie = urllib.parse.unquote(m.group(1))
+                    break
 
             if not cookie:
                 raise ValueError("No session cookie in login response")
+            return cookie
 
-            data = body.get("data", {})
-            vehicles = data.get("vehicles") or data.get("veh") or []
-            vehicle_id = vehicles[0].get("vid") if vehicles else 0
-            if not vehicle_id:
-                vehicle_id = data.get("vid") or 0
+    async def _get_vehicle_id(self, cookie: str) -> int:
+        encoded = urllib.parse.quote(urllib.parse.quote(cookie))
+        params = {**WS_PARAMS, "cookie": encoded}
+        url = WS_URL + "?" + "&".join(f"{k}={v}" for k, v in params.items())
 
-            return cookie, int(vehicle_id)
+        async with aiohttp.ClientSession() as session:
+            async with session.ws_connect(
+                url,
+                headers={"Cookie": f"connect.sid={cookie}"},
+                ssl=True,
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as ws:
+                await ws.send_str(json.dumps({"a": "getDynamicData"}))
+                async for msg in ws:
+                    if msg.type == aiohttp.WSMsgType.TEXT:
+                        payload = json.loads(msg.data)
+                        if payload.get("a") == "dynamicData":
+                            vehicles = payload.get("d", {}).get("wirelessLastSeen", [])
+                            if vehicles:
+                                return int(vehicles[0]["vid"])
+        raise ValueError("No vehicles found")
 
-    async def _test_ws(self, cookie: str, vehicle_id: int) -> bool:
-        encoded_cookie = urllib.parse.quote(urllib.parse.quote(cookie))
-        params = {**WS_PARAMS, "cookie": encoded_cookie}
-        query = "&".join(f"{k}={v}" for k, v in params.items())
-        url = f"{WS_BASE}?{query}"
+    async def _test_ws(self, cookie: str) -> bool:
+        encoded = urllib.parse.quote(urllib.parse.quote(cookie))
+        params = {**WS_PARAMS, "cookie": encoded}
+        url = WS_URL + "?" + "&".join(f"{k}={v}" for k, v in params.items())
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.ws_connect(url, ssl=True, timeout=aiohttp.ClientTimeout(total=10)) as ws:
                     async for msg in ws:
                         if msg.type == aiohttp.WSMsgType.TEXT:
-                            payload = json.loads(msg.data)
-                            if payload.get("a") == "ready":
+                            if json.loads(msg.data).get("a") == "ready":
                                 return True
         except Exception:
-            return False
+            pass
         return False

@@ -3,15 +3,15 @@
     "step": {
       "user": {
         "title": "Ajjas GPS Tracker",
-        "description": "Enter your Ajjas account credentials.",
+        "description": "Enter your Ajjas mobile number and password.",
         "data": {
-          "email": "Email",
+          "mobile": "Mobile Number (e.g. +919876543210)",
           "password": "Password"
         }
       },
       "manual": {
-        "title": "Ajjas — Manual Cookie Setup",
-        "description": "Enter your session cookie (connect.sid value) and vehicle ID. You can find these using a proxy like mitmproxy.",
+        "title": "Ajjas — Manual Setup",
+        "description": "Enter your session cookie (connect.sid value) and vehicle ID.",
         "data": {
           "cookie": "Session Cookie",
           "vehicle_id": "Vehicle ID"
@@ -19,8 +19,8 @@
       }
     },
     "error": {
-      "invalid_auth": "Invalid email or password.",
-      "cannot_connect": "Could not connect to Ajjas servers."
+      "invalid_auth": "Invalid mobile number or password.",
+      "cannot_connect": "Cannot connect to Ajjas servers."
     }
   }
 }
