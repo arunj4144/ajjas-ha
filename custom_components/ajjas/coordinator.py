@@ -27,7 +27,7 @@ class AjjasCoordinator(DataUpdateCoordinator):
         self.data: dict = {}
 
     def _ws_url(self) -> str:
-        encoded = urllib.parse.quote(urllib.parse.quote(self.cookie))
+        encoded = urllib.parse.quote(self.cookie)
         params = {**WS_PARAMS, "cookie": encoded}
         return WS_URL + "?" + "&".join(f"{k}={v}" for k, v in params.items())
 

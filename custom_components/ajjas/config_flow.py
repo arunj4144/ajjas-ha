@@ -81,11 +81,12 @@ class AjjasConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             if resp.status != 200:
                 raise ValueError(f"Login failed: HTTP {resp.status}")
 
+            # Keep cookie URL-encoded as-is from Set-Cookie header (s%3A...)
             cookie = None
             for set_cookie in resp.headers.getall("Set-Cookie", []):
                 m = re.search(r"connect\.sid=([^;]+)", set_cookie)
                 if m:
-                    cookie = urllib.parse.unquote(m.group(1))
+                    cookie = m.group(1)
                     break
 
             if not cookie:
@@ -93,7 +94,7 @@ class AjjasConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             return cookie
 
     async def _get_vehicle_id(self, cookie: str) -> int:
-        encoded = urllib.parse.quote(urllib.parse.quote(cookie))
+        encoded = urllib.parse.quote(cookie)
         params = {**WS_PARAMS, "cookie": encoded}
         url = WS_URL + "?" + "&".join(f"{k}={v}" for k, v in params.items())
 
@@ -115,7 +116,7 @@ class AjjasConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         raise ValueError("No vehicles found")
 
     async def _test_ws(self, cookie: str) -> bool:
-        encoded = urllib.parse.quote(urllib.parse.quote(cookie))
+        encoded = urllib.parse.quote(cookie)
         params = {**WS_PARAMS, "cookie": encoded}
         url = WS_URL + "?" + "&".join(f"{k}={v}" for k, v in params.items())
         try:
