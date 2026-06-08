@@ -11,12 +11,12 @@ import voluptuous as vol
 from homeassistant import config_entries
 from homeassistant.data_entry_flow import FlowResult
 
-from .const import DOMAIN, LOGIN_URL, WS_URL, WS_PARAMS, WS_HEADERS
+from .const import DOMAIN, LOGIN_URL, WS_HEADERS
 
 _LOGGER = logging.getLogger(__name__)
 
 STEP_USER_SCHEMA = vol.Schema({
-    vol.Required("mobile", description={"suggested_value": "+91"}): str,
+    vol.Required("mobile"): str,
     vol.Required("password"): str,
 })
 
@@ -36,17 +36,22 @@ class AjjasConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             if not mobile.startswith("+"):
                 mobile = "+91" + mobile.lstrip("0")
             try:
-                cookie, vehicle_id = await asyncio.wait_for(
-                    self._login_and_get_vehicle(mobile, user_input["password"]),
-                    timeout=25,
+                cookie, user_data = await asyncio.wait_for(
+                    self._do_login(mobile, user_input["password"]),
+                    timeout=15,
                 )
                 return self.async_create_entry(
-                    title=f"Ajjas ({mobile})",
-                    data={"mobile": mobile, "cookie": cookie, "vehicle_id": vehicle_id},
+                    title=f"Ajjas ({user_data.get('fn', mobile)})",
+                    data={
+                        "mobile": mobile,
+                        "cookie": cookie,
+                        "vehicle_id": 0,  # discovered on first coordinator refresh
+                    },
                 )
             except asyncio.TimeoutError:
+                _LOGGER.error("Ajjas login timed out")
                 errors["base"] = "cannot_connect"
-            except ValueError:
+            except PermissionError:
                 errors["base"] = "invalid_auth"
             except Exception as err:
                 _LOGGER.error("Ajjas setup error: %s", err)
@@ -59,34 +64,31 @@ class AjjasConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         )
 
     async def async_step_manual(self, user_input: dict[str, Any] | None = None) -> FlowResult:
-        errors: dict[str, str] = {}
         if user_input is not None:
-            cookie = user_input["cookie"].strip()
-            vehicle_id = int(user_input["vehicle_id"])
             return self.async_create_entry(
-                title=f"Ajjas (Vehicle {vehicle_id})",
-                data={"cookie": cookie, "vehicle_id": vehicle_id},
+                title=f"Ajjas (Vehicle {user_input['vehicle_id']})",
+                data={"cookie": user_input["cookie"].strip(), "vehicle_id": int(user_input["vehicle_id"])},
             )
-        return self.async_show_form(step_id="manual", data_schema=STEP_COOKIE_SCHEMA, errors=errors)
+        return self.async_show_form(step_id="manual", data_schema=STEP_COOKIE_SCHEMA, errors={})
 
-    async def _login_and_get_vehicle(self, mobile: str, password: str) -> tuple[str, int]:
+    async def _do_login(self, mobile: str, password: str) -> tuple[str, dict]:
         connector = aiohttp.TCPConnector(family=socket.AF_INET)
         async with aiohttp.ClientSession(connector=connector) as session:
-            # Step 1: Login
             resp = await session.post(
                 LOGIN_URL,
                 json={"cmob": mobile, "pwd": password, "alang": 1},
                 headers={**WS_HEADERS, "Content-Type": "application/json"},
                 timeout=aiohttp.ClientTimeout(total=10),
             )
-            if resp.status != 200:
-                raise ValueError(f"Login HTTP {resp.status}")
+            _LOGGER.debug("Ajjas login status: %s", resp.status)
 
             body = await resp.json(content_type=None)
-            if body.get("message") != "OK":
-                raise ValueError("Login rejected")
+            _LOGGER.debug("Ajjas login response: %s", body.get("message"))
 
-            # Extract cookie keeping it URL-encoded as-is (s%3A...)
+            if resp.status != 200 or body.get("message") != "OK":
+                raise PermissionError(f"Login failed: {resp.status} {body.get('message')}")
+
+            # Extract cookie keeping URL-encoding as-is (s%3A...)
             cookie = None
             for set_cookie in resp.headers.getall("Set-Cookie", []):
                 m = re.search(r"connect\.sid=([^;]+)", set_cookie)
@@ -95,35 +97,6 @@ class AjjasConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     break
 
             if not cookie:
-                raise ValueError("No session cookie")
+                raise PermissionError("No session cookie in response")
 
-            # Step 2: Get vehicle ID via WebSocket
-            vehicle_id = await self._get_vehicle_id(session, cookie)
-            return cookie, vehicle_id
-
-    async def _get_vehicle_id(self, session: aiohttp.ClientSession, cookie: str) -> int:
-        encoded = urllib.parse.quote(cookie)
-        params = {**WS_PARAMS, "cookie": encoded}
-        url = WS_URL + "?" + "&".join(f"{k}={v}" for k, v in params.items())
-
-        async with session.ws_connect(
-            url,
-            headers={"Cookie": f"connect.sid={cookie}"},
-            ssl=True,
-            timeout=aiohttp.ClientTimeout(total=10),
-        ) as ws:
-            await ws.send_str(json.dumps({"a": "getDynamicData"}))
-            try:
-                async with asyncio.timeout(10):
-                    async for msg in ws:
-                        if msg.type != aiohttp.WSMsgType.TEXT:
-                            continue
-                        payload = json.loads(msg.data)
-                        if payload.get("a") == "dynamicData":
-                            vehicles = payload.get("d", {}).get("wirelessLastSeen", [])
-                            if vehicles:
-                                return int(vehicles[0]["vid"])
-            except (asyncio.TimeoutError, Exception):
-                pass
-
-        raise ValueError("No vehicles found")
+            return cookie, body.get("data", {})

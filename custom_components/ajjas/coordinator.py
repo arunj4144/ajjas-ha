@@ -64,7 +64,8 @@ class AjjasCoordinator(DataUpdateCoordinator):
                 timeout=aiohttp.ClientTimeout(total=20),
             ) as ws:
                 await ws.send_str(json.dumps({"a": "getDynamicData"}))
-                await ws.send_str(json.dumps({"a": "subVeh", "d": {"veh": [self.vehicle_id]}}))
+                if self.vehicle_id:
+                    await ws.send_str(json.dumps({"a": "subVeh", "d": {"veh": [self.vehicle_id]}}))
                 await ws.send_str(json.dumps({"a": "fetchData"}))
                 await ws.send_str(json.dumps({
                     "a": "exapireq",
@@ -94,7 +95,14 @@ class AjjasCoordinator(DataUpdateCoordinator):
 
                     action = payload.get("a")
 
-                    if action == "sData":
+                    if action == "dynamicData" and not self.vehicle_id:
+                        vehicles = payload.get("d", {}).get("wirelessLastSeen", [])
+                        if vehicles:
+                            self.vehicle_id = int(vehicles[0]["vid"])
+                            _LOGGER.info("Ajjas: discovered vehicle ID %s", self.vehicle_id)
+                            await ws.send_str(json.dumps({"a": "subVeh", "d": {"veh": [self.vehicle_id]}}))
+
+                    elif action == "sData":
                         bikes = payload.get("d", {}).get("bikes", [])
                         for bike in bikes:
                             if bike.get("idx") == self.vehicle_id:
