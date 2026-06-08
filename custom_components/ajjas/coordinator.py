@@ -50,8 +50,22 @@ class AjjasCoordinator(DataUpdateCoordinator):
             raise UpdateFailed(f"Ajjas update failed: {err}") from err
 
     async def _fetch(self) -> dict:
+        last_err: Exception | None = None
+        for attempt in range(3):
+            if attempt > 0:
+                await self._reset_session()
+                await asyncio.sleep(2)
+            try:
+                return await self._fetch_once()
+            except UpdateFailed as err:
+                last_err = err
+        raise last_err  # type: ignore[misc]
+
+    async def _fetch_once(self) -> dict:
         if self._session is None or self._session.closed:
-            connector = aiohttp.TCPConnector(family=socket.AF_INET)
+            # Use ThreadedResolver to avoid aiodns/c-ares DNS failures in Docker containers
+            resolver = aiohttp.ThreadedResolver()
+            connector = aiohttp.TCPConnector(family=socket.AF_INET, resolver=resolver)
             self._session = aiohttp.ClientSession(connector=connector)
 
         result = dict(self.data)
@@ -61,30 +75,11 @@ class AjjasCoordinator(DataUpdateCoordinator):
                 self._ws_url(),
                 headers=self._ws_headers(),
                 ssl=True,
-                timeout=aiohttp.ClientTimeout(total=20),
+                timeout=aiohttp.ClientTimeout(total=30),
             ) as ws:
-                await ws.send_str(json.dumps({"a": "getDynamicData"}))
-                if self.vehicle_id:
-                    await ws.send_str(json.dumps({"a": "subVeh", "d": {"veh": [self.vehicle_id]}}))
-                await ws.send_str(json.dumps({"a": "fetchData"}))
-                await ws.send_str(json.dumps({
-                    "a": "exapireq",
-                    "d": {"req": {"url": "/gl/users/rides/getridesforalluservehicle", "method": "POST",
-                                  "jsonBody": json.dumps({"vidMap": {str(self.vehicle_id): 0}, "oldestRidWithRunningTime": True})}},
-                    "r": 10,
-                }))
-                await ws.send_str(json.dumps({
-                    "a": "exapireq",
-                    "d": {"req": {"url": f"/gl/users/overspeed/getzone?vid={self.vehicle_id}", "method": "GET"}},
-                    "r": 11,
-                }))
-                await ws.send_str(json.dumps({
-                    "a": "exapireq",
-                    "d": {"req": {"url": f"/gl/users/geofence/getGeofences?vid={self.vehicle_id}", "method": "GET"}},
-                    "r": 12,
-                }))
-
                 received = set()
+                requests_sent = False
+
                 async for msg in ws:
                     if msg.type != aiohttp.WSMsgType.TEXT:
                         break
@@ -95,15 +90,43 @@ class AjjasCoordinator(DataUpdateCoordinator):
 
                     action = payload.get("a")
 
-                    if action == "dynamicData" and not self.vehicle_id:
+                    # Server sends ready → msync before processing any client requests.
+                    # Only send our requests after msync is received.
+                    if action == "msync" and not requests_sent:
+                        requests_sent = True
+                        await ws.send_str(json.dumps({"a": "getDynamicData"}))
+                        await ws.send_str(json.dumps({"a": "fetchData"}))
+                        if self.vehicle_id:
+                            await ws.send_str(json.dumps({"a": "subVeh", "d": {"veh": [self.vehicle_id]}}))
+                            await self._send_data_requests(ws)
+
+                    elif action == "ver_upd":
+                        _LOGGER.debug("Ajjas: app version update available (version %s)", payload.get("d", {}).get("version"))
+
+                    elif action == "kick":
+                        _LOGGER.warning("Ajjas: session kicked by server (another login detected)")
+                        raise UpdateFailed("Ajjas session kicked — re-add the integration to get a fresh session")
+
+                    elif action == "dynamicData":
                         vehicles = payload.get("d", {}).get("wirelessLastSeen", [])
-                        if vehicles:
+                        if vehicles and not self.vehicle_id:
                             self.vehicle_id = int(vehicles[0]["vid"])
                             _LOGGER.info("Ajjas: discovered vehicle ID %s", self.vehicle_id)
                             await ws.send_str(json.dumps({"a": "subVeh", "d": {"veh": [self.vehicle_id]}}))
+                            await self._send_data_requests(ws)
+
+                        for v in vehicles:
+                            if v.get("vid") == self.vehicle_id:
+                                result.update(self._parse_live(v))
+                                received.add("live")
 
                     elif action == "sData":
                         bikes = payload.get("d", {}).get("bikes", [])
+                        # If vehicle_id still unknown, pick the first non-admin bike
+                        if not self.vehicle_id and bikes:
+                            self.vehicle_id = int(bikes[0]["idx"])
+                            _LOGGER.info("Ajjas: discovered vehicle ID %s from sData", self.vehicle_id)
+                            await self._send_data_requests(ws)
                         for bike in bikes:
                             if bike.get("idx") == self.vehicle_id:
                                 result.update({
@@ -116,12 +139,6 @@ class AjjasCoordinator(DataUpdateCoordinator):
                                     "imei": bike.get("dev", {}).get("imei"),
                                 })
                                 received.add("sdata")
-
-                    elif action == "dynamicData":
-                        for v in payload.get("d", {}).get("wirelessLastSeen", []):
-                            if v.get("vid") == self.vehicle_id:
-                                result.update(self._parse_live(v))
-                                received.add("live")
 
                     elif action == "locUpd":
                         d = payload.get("d", {})
@@ -145,25 +162,46 @@ class AjjasCoordinator(DataUpdateCoordinator):
                         data = body.get("data", {})
 
                         if r_id == 10:
-                            result["rides"] = data.get("rides", [])
-                            result["fuel_logs"] = data.get("fuelLog", [])
+                            result["rides"] = data.get("rides", []) if isinstance(data, dict) else []
+                            result["fuel_logs"] = data.get("fuelLog", []) if isinstance(data, dict) else []
                             received.add("rides")
                         elif r_id == 11:
-                            result["overspeed_zones"] = data if isinstance(data, list) else data.get("zones", [])
+                            result["overspeed_zones"] = data if isinstance(data, list) else (data.get("zones", []) if isinstance(data, dict) else [])
                             received.add("overspeed")
                         elif r_id == 12:
-                            result["geofences"] = data if isinstance(data, list) else data.get("geofences", [])
+                            result["geofences"] = data if isinstance(data, list) else (data.get("geofences", []) if isinstance(data, dict) else [])
                             received.add("geofences")
 
                     if received >= {"live", "rides", "sdata"}:
                         break
 
         except asyncio.TimeoutError as err:
+            await self._reset_session()
             raise UpdateFailed("Ajjas WebSocket timeout") from err
         except aiohttp.ClientError as err:
+            await self._reset_session()
             raise UpdateFailed(f"Ajjas connection error: {err}") from err
 
         return result
+
+    async def _send_data_requests(self, ws) -> None:
+        vid = self.vehicle_id
+        await ws.send_str(json.dumps({
+            "a": "exapireq",
+            "d": {"req": {"url": "/gl/users/rides/getridesforalluservehicle", "method": "POST",
+                          "jsonBody": json.dumps({"vidMap": {str(vid): 0}, "oldestRidWithRunningTime": True})}},
+            "r": 10,
+        }))
+        await ws.send_str(json.dumps({
+            "a": "exapireq",
+            "d": {"req": {"url": f"/gl/users/overspeed/getzone?vid={vid}", "method": "GET"}},
+            "r": 11,
+        }))
+        await ws.send_str(json.dumps({
+            "a": "exapireq",
+            "d": {"req": {"url": f"/gl/users/geofence/getGeofences?vid={vid}", "method": "GET"}},
+            "r": 12,
+        }))
 
     def _parse_live(self, v: dict) -> dict:
         hbt = v.get("hbt", {})
@@ -183,6 +221,10 @@ class AjjasCoordinator(DataUpdateCoordinator):
             "yesterday_distance": round(dst.get("prev", 0) / 1000, 2),
         }
 
-    async def async_shutdown(self) -> None:
+    async def _reset_session(self) -> None:
         if self._session and not self._session.closed:
             await self._session.close()
+        self._session = None
+
+    async def async_shutdown(self) -> None:
+        await self._reset_session()
