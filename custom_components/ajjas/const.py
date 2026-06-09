@@ -25,3 +25,5 @@ WS_PARAMS = {"reqver": "294", "reqsrc": "ha", "prodId": "1", "theme": "dark"}
 SCAN_INTERVAL = 30
 SCAN_INTERVAL_RIDING = 5
 WAYPOINT_BUFFER_SIZE = 500
+WAYPOINT_MIN_DIST_KM = 0.1   # 100 m minimum gap between stored waypoints
+TRIP_HISTORY_MAX = 20        # keep last 20 completed trips in memory

@@ -7,6 +7,7 @@ import json
 import logging
 import math
 import socket
+import time
 import urllib.parse
 from datetime import timedelta
 from typing import Any
@@ -18,7 +19,9 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, Upda
 from .const import (
     DOMAIN,
     SCAN_INTERVAL,
+    TRIP_HISTORY_MAX,
     WAYPOINT_BUFFER_SIZE,
+    WAYPOINT_MIN_DIST_KM,
     WS_HEADERS,
     WS_PARAMS,
     WS_URL,
@@ -35,6 +38,14 @@ def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     dlambda = math.radians(lon2 - lon1)
     a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
     return r * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+
+def _downsample(wps: list, target: int = 50) -> list:
+    """Thin a waypoint list to at most `target` evenly-spaced points."""
+    if len(wps) <= target:
+        return list(wps)
+    step = len(wps) / target
+    return [wps[int(i * step)] for i in range(target)]
 
 
 class AjjasCoordinator(DataUpdateCoordinator):
@@ -58,6 +69,17 @@ class AjjasCoordinator(DataUpdateCoordinator):
         self._ride_distance: float = 0.0
         self._ride_start_ts: Any = None
         self._stream_task: asyncio.Task | None = None
+
+        # Trip history (completed rides)
+        self._trip_history: list[dict] = []
+
+    # ------------------------------------------------------------------
+    # Public helpers
+    # ------------------------------------------------------------------
+
+    @property
+    def trip_history(self) -> list[dict]:
+        return list(self._trip_history)
 
     # ------------------------------------------------------------------
     # Session helpers
@@ -117,18 +139,52 @@ class AjjasCoordinator(DataUpdateCoordinator):
             self._start_stream()
         elif not ignition and self._riding:
             _LOGGER.debug("Ajjas: ride ended (via poll)")
-            self._last_ride_waypoints = list(self._waypoints)
-            self._riding = False
+            self._complete_trip()
         elif ignition and self._riding:
             self._append_waypoint(result)
             if self._stream_task is None or self._stream_task.done():
                 self._start_stream()
 
-        result["ride_waypoints"] = list(self._waypoints)
-        result["last_ride_waypoints"] = list(self._last_ride_waypoints)
-        result["is_riding"] = self._riding
-        result["ride_distance_km"] = round(self._ride_distance, 3)
-        result["ride_start_ts"] = self._ride_start_ts
+        self._inject_ride_state(result)
+
+    def _inject_ride_state(self, d: dict) -> None:
+        """Write current ride state into a result dict."""
+        d["ride_waypoints"] = list(self._waypoints)
+        d["last_ride_waypoints"] = list(self._last_ride_waypoints)
+        d["is_riding"] = self._riding
+        d["ride_distance_km"] = round(self._ride_distance, 3)
+        d["ride_start_ts"] = self._ride_start_ts
+        d["trip_history"] = self.trip_history
+
+    # ------------------------------------------------------------------
+    # Trip completion helper
+    # ------------------------------------------------------------------
+
+    def _complete_trip(self) -> None:
+        """Save current ride to history and reset ride state."""
+        if self._waypoints and self._ride_distance >= WAYPOINT_MIN_DIST_KM:
+            trip = {
+                "id": len(self._trip_history) + 1,
+                "start_ts": self._ride_start_ts,
+                "end_ts": int(time.time()),
+                "waypoints": _downsample(self._waypoints, 50),
+                "distance_km": round(self._ride_distance, 3),
+                "max_speed": round(max((w[2] for w in self._waypoints), default=0), 1),
+                "avg_speed": round(
+                    sum(w[2] for w in self._waypoints) / len(self._waypoints), 1
+                ),
+            }
+            self._trip_history.append(trip)
+            if len(self._trip_history) > TRIP_HISTORY_MAX:
+                self._trip_history = self._trip_history[-TRIP_HISTORY_MAX:]
+            _LOGGER.info(
+                "Ajjas: trip #%d saved — %.1f km", trip["id"], trip["distance_km"]
+            )
+
+        self._last_ride_waypoints = list(self._waypoints)
+        self._riding = False
+        self._waypoints = []
+        self._ride_distance = 0.0
 
     # ------------------------------------------------------------------
     # Waypoint helpers
@@ -143,10 +199,18 @@ class AjjasCoordinator(DataUpdateCoordinator):
         self._add_to_waypoints(float(lat), float(lon), spd)
 
     def _add_to_waypoints(self, lat: float, lon: float, spd: float) -> None:
+        """Store waypoint only if >= 100 m from last; always accumulate distance."""
+        lat_r = round(lat, 6)
+        lon_r = round(lon, 6)
+
         if self._waypoints:
             prev = self._waypoints[-1]
-            self._ride_distance += _haversine_km(prev[0], prev[1], lat, lon)
-        self._waypoints.append([round(lat, 6), round(lon, 6), round(spd, 1)])
+            dist = _haversine_km(prev[0], prev[1], lat_r, lon_r)
+            self._ride_distance += dist
+            if dist < WAYPOINT_MIN_DIST_KM:
+                return  # too close — distance accumulated, point not stored
+
+        self._waypoints.append([lat_r, lon_r, round(spd, 1)])
         if len(self._waypoints) > WAYPOINT_BUFFER_SIZE:
             self._waypoints = self._waypoints[-WAYPOINT_BUFFER_SIZE:]
 
@@ -181,11 +245,8 @@ class AjjasCoordinator(DataUpdateCoordinator):
                     await asyncio.sleep(5)
         finally:
             _LOGGER.info("Ajjas: WS stream ended — restoring polling interval")
-            if self._waypoints:
-                self._last_ride_waypoints = list(self._waypoints)
-            self._riding = False
-            self._waypoints = []
-            self._ride_distance = 0.0
+            if self._riding:
+                self._complete_trip()
             self.update_interval = timedelta(seconds=SCAN_INTERVAL)
             with contextlib.suppress(Exception):
                 self._schedule_refresh()
@@ -247,18 +308,12 @@ class AjjasCoordinator(DataUpdateCoordinator):
                     if lat is not None and lng is not None:
                         self._add_to_waypoints(float(lat), float(lng), spd)
 
-                    new_data["ride_waypoints"] = list(self._waypoints)
-                    new_data["last_ride_waypoints"] = list(self._last_ride_waypoints)
-                    new_data["is_riding"] = self._riding
-                    new_data["ride_distance_km"] = round(self._ride_distance, 3)
-                    new_data["ride_start_ts"] = self._ride_start_ts
-
+                    self._inject_ride_state(new_data)
                     self.async_set_updated_data(new_data)
 
                     if ign is not None and not bool(ign):
                         _LOGGER.info("Ajjas: ignition off (locUpd) — stopping stream")
-                        self._last_ride_waypoints = list(self._waypoints)
-                        self._riding = False
+                        self._complete_trip()
                         return
 
                 elif action == "dynamicData":
@@ -267,11 +322,11 @@ class AjjasCoordinator(DataUpdateCoordinator):
                         if v.get("vid") == self.vehicle_id:
                             new_data = dict(self.data) if self.data else {}
                             new_data.update(self._parse_live(v))
+                            self._inject_ride_state(new_data)
                             self.async_set_updated_data(new_data)
                             if not new_data.get("ignition"):
                                 _LOGGER.info("Ajjas: ignition off (dynamicData) — stopping stream")
-                                self._last_ride_waypoints = list(self._waypoints)
-                                self._riding = False
+                                self._complete_trip()
                                 return
                             break
 
@@ -402,7 +457,7 @@ class AjjasCoordinator(DataUpdateCoordinator):
                             )
                             received.add("geofences")
 
-                    elif action == "ver_upd":
+                    elif action in ("ver_upd",):
                         pass
 
                     elif action == "kick":

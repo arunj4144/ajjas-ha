@@ -204,6 +204,7 @@ class KtmRideTrackSensor(CoordinatorEntity[AjjasCoordinator], SensorEntity):
             "is_riding": d.get("is_riding", False),
             "ride_start_ts": d.get("ride_start_ts"),
             "last_ride_waypoints": last_waypoints[-200:],
+            "trip_history": self.coordinator.trip_history,
         }
 
 
