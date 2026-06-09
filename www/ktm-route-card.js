@@ -516,10 +516,13 @@
       const dist       = attrs.ride_distance_km     || 0;
       const ptCount    = attrs.waypoint_count       || wps.length;
 
+      // Prefer lat/lon from ride_track sensor attrs; fall back to device_tracker
       const ta  = tracker?.attributes || {};
-      const lat = ta.latitude  != null ? parseFloat(ta.latitude)  : null;
-      const lon = ta.longitude != null ? parseFloat(ta.longitude) : null;
-      const spd = parseFloat(ta.speed_kmh || 0);
+      const lat = attrs.current_lat  != null ? parseFloat(attrs.current_lat)
+                : ta.latitude        != null ? parseFloat(ta.latitude)  : null;
+      const lon = attrs.current_lon  != null ? parseFloat(attrs.current_lon)
+                : ta.longitude       != null ? parseFloat(ta.longitude) : null;
+      const spd = parseFloat(attrs.current_speed ?? ta.speed_kmh ?? 0);
 
       // Rebuild history dropdown on trips change
       const tripsKey = trips.length + (trips[trips.length-1]?.id || 0);
